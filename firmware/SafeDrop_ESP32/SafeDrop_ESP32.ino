@@ -115,18 +115,19 @@ char wifiPass[65] = "";
 char boxId[24] = "";
 char deviceKey[65] = "";
 char claimCode[13] = "";
-bool needsClaim = false;
+// volatile: written/read across the network task and the main loop task
+bool volatile needsClaim = false;
 unsigned long lastClaimAttemptMs = 0;
 
 // ---------- state machine (IDLE / KEYPAD / OPEN / LOCKOUT) ----------
 enum State { STATE_IDLE, STATE_KEYPAD, STATE_OPEN, STATE_LOCKOUT };
-State state = STATE_IDLE;
+State volatile state = STATE_IDLE;
 
 char activeCode[CODE_LEN + 1] = "";  // the passcode to match
 char activeCodeId[CODE_ID_LEN + 1] = "";
 unsigned long codeExpiresMs = 0;
 unsigned long lastPollMs = 0;
-unsigned long lastKeyMs = 0;
+unsigned long volatile lastKeyMs = 0;
 unsigned long lockoutUntilMs = 0;
 unsigned long redOffAtMs = 0;
 unsigned long openedAtMs = 0;  // when the box unlocked ('#' guard window)
@@ -135,9 +136,9 @@ char entry[CODE_LEN + 1] = "";
 byte entryLen = 0;
 
 // pending event queue, flushed when Wi-Fi is up
-bool pendingUsed = false;
-bool pendingWrong = false;
-bool pendingClosed = false;
+bool volatile pendingUsed = false;
+bool volatile pendingWrong = false;
+bool volatile pendingClosed = false;
 char pendingUsedCodeId[CODE_ID_LEN + 1] = "";
 
 WiFiClientSecure wifiClient;
@@ -147,6 +148,43 @@ Servo lockServo;
 WiFiServer setupServer(80);
 
 const char* maskedEntry();
+
+// Keypad inputs arrive through this queue from the fast scan task, so no
+// press is lost while HTTPS requests, delays or Wi-Fi reconnects block the
+// main loop. Created in setup(); the main loop drains and processes it.
+QueueHandle_t keyQueue;
+
+void keypadScanTask(void*) {
+  for (;;) {
+    char key = keypad.getKey();
+    if (key) xQueueSend(keyQueue, &key, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// All blocking network work (polls, event reports, claim, Wi-Fi reconnect)
+// runs in its own task; the main loop only handles UI/state, so keypad
+// presses and LCD updates never wait on HTTPS.
+QueueHandle_t netEventQueue;
+SemaphoreHandle_t stateMutex;
+
+// network task -> main loop UI events
+enum { NET_EVENT_CODE_CLEARED = 1, NET_EVENT_CLAIM_OK, NET_EVENT_CLAIM_FAILED };
+
+void netPushEvent(int type) {
+  xQueueSend(netEventQueue, &type, 0);
+}
+
+/** Store the fetched one-time code (called from the network task). */
+void setActiveCode(const char* codeId, const char* code, unsigned long expiresAtMs) {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  strncpy(activeCodeId, codeId, CODE_ID_LEN);
+  activeCodeId[CODE_ID_LEN] = '\0';
+  strncpy(activeCode, code, CODE_LEN);
+  activeCode[CODE_LEN] = '\0';
+  codeExpiresMs = expiresAtMs;
+  xSemaphoreGive(stateMutex);
+}
 
 // ---------- small helpers ----------
 // The ESP32 EEPROM library emulates EEPROM over NVS flash: it buffers
@@ -315,9 +353,11 @@ void connectWiFi() {
 
 // ---------- HTTP ----------
 void clearCode() {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
   activeCode[0] = '\0';
   activeCodeId[0] = '\0';
   codeExpiresMs = 0;
+  xSemaphoreGive(stateMutex);
 }
 
 /**
@@ -342,7 +382,9 @@ bool postJson(const char* path, const char* payload, bool withAuth,
 
   int status = http.responseStatusCode();
   response = http.responseBody();
-  http.stop();
+  // Keep-alive: close only on failure so the next request reuses the TLS
+  // session; a stalled server-side session reconnects on the next call.
+  if (status <= 0) http.stop();
   return status == 200;
 }
 
@@ -365,7 +407,8 @@ String getSync(const char* path) {
 
   int status = http.responseStatusCode();
   String body = http.responseBody();
-  http.stop();
+  // Keep-alive: see postJson — close only when the session is broken.
+  if (status <= 0) http.stop();
   return status == 200 ? body : "";
 }
 
@@ -420,9 +463,13 @@ void pollSync() {
   if (jsonErr) return;
 
   if (doc["none"].is<bool>()) {
-    if (activeCode[0] != '\0') {
+    bool hadCode;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    hadCode = activeCode[0] != '\0';
+    xSemaphoreGive(stateMutex);
+    if (hadCode) {
       clearCode();
-      lcdShow("Code cleared", "");
+      netPushEvent(NET_EVENT_CODE_CLEARED);
     }
     return;
   }
@@ -437,11 +484,7 @@ void pollSync() {
     return;
   }
 
-  strncpy(activeCodeId, codeId, CODE_ID_LEN);
-  activeCodeId[CODE_ID_LEN] = '\0';
-  strncpy(activeCode, code, CODE_LEN);
-  activeCode[CODE_LEN] = '\0';
-  codeExpiresMs = millis() + (unsigned long)ttlSeconds * 1000UL;
+  setActiveCode(codeId, code, millis() + (unsigned long)ttlSeconds * 1000UL);
   Serial.print("Code received, ttl(s)=");
   Serial.println(ttlSeconds);
 }
@@ -484,12 +527,51 @@ bool tryClaim() {
   return true;
 }
 
+/**
+ * All blocking network work lives on this task: /sync polling, queued
+ * event reports, claim retries and Wi-Fi reconnects. The main loop task
+ * stays free for the keypad and LCD, so no press ever waits on HTTPS.
+ */
+void networkTask(void*) {
+  for (;;) {
+    unsigned long now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (needsClaim && now - lastClaimAttemptMs >= 30000UL) {
+        lastClaimAttemptMs = now;
+        if (tryClaim()) {
+          netPushEvent(NET_EVENT_CLAIM_OK);
+        } else {
+          netPushEvent(NET_EVENT_CLAIM_FAILED);
+        }
+      }
+      flushPendingEvents();
+      // same heartbeat as the old loop: idle-only polling
+      if (state == STATE_IDLE &&
+          now - lastPollMs >= POLL_INTERVAL_MS &&
+          now - lastKeyMs >= KEYPAD_QUIET_MS) {
+        lastPollMs = now;
+        pollSync();
+      }
+    } else {
+      connectWiFi();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 // ---------- state machine actions ----------
 void handleCorrectEntry() {
-  // flash first, RAM second: the used codeId can never be lost.
-  eepromAddCodeId(activeCodeId);
-  strncpy(pendingUsedCodeId, activeCodeId, CODE_ID_LEN);
-  pendingUsedCodeId[CODE_ID_LEN] = '\0';
+  // snapshot the codeId under the mutex, then flash first, RAM second:
+  // the used codeId can never be lost.
+  char usedCodeId[CODE_ID_LEN + 1];
+  if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+    strncpy(usedCodeId, activeCodeId, CODE_ID_LEN);
+    usedCodeId[CODE_ID_LEN] = '\0';
+    strncpy(pendingUsedCodeId, usedCodeId, CODE_ID_LEN);
+    pendingUsedCodeId[CODE_ID_LEN] = '\0';
+    xSemaphoreGive(stateMutex);
+  }
+  eepromAddCodeId(usedCodeId);
   clearCode();
   entryLen = 0;
   entry[0] = '\0';
@@ -581,7 +663,12 @@ void handleKey(char key) {
       state = STATE_IDLE;
       return;
     }
-    if (strcmp(entry, activeCode) == 0) {
+    bool submittedMatches = false;
+    if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+      submittedMatches = strcmp(entry, activeCode) == 0;
+      xSemaphoreGive(stateMutex);
+    }
+    if (submittedMatches) {
       handleCorrectEntry();
     } else {
       wrongCount++;
@@ -774,6 +861,10 @@ void setup() {
   Serial.begin(115200);
   EEPROM.begin(1024);  // highest used address is 602; NVS-backed
 
+  // Reuse the TLS session between requests: a fresh handshake on every
+  // 3 s poll blocked the loop for 1-2 s and dropped keypad presses.
+  http.connectionKeepAlive();
+
   pinMode(PIN_GREEN, OUTPUT);
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
@@ -839,8 +930,18 @@ void setup() {
   connectWiFi();
   if (needsClaim) {
     lcdShow("Claiming box...", claimCode);
-    tryClaim();  // if it fails, loop() retries every 30 s
+    tryClaim();  // if it fails, the network task retries every 30 s
   }
+
+  // Fast keypad scanning + off-loop network work start only now: the
+  // setup-* window above still polls the keypad from the main context.
+  stateMutex = xSemaphoreCreateMutex();
+  netEventQueue = xQueueCreate(8, sizeof(int));
+  xTaskCreatePinnedToCore(networkTask, "net", 8192, nullptr, 1, nullptr, 0);
+
+  keyQueue = xQueueCreate(8, sizeof(char));
+  xTaskCreatePinnedToCore(keypadScanTask, "keypad", 4096, nullptr, 1, nullptr, 0);
+
   lcdShow("Enter Code", "");
 }
 
@@ -853,32 +954,36 @@ void loop() {
     redOffAtMs = 0;
   }
 
-  // local TTL expiry (no RTC, so the countdown is millis()-based)
-  if (activeCode[0] != '\0' && now > codeExpiresMs) {
-    clearCode();
-    lcdShow("Code expired", "");
-  }
-
-  // keep Wi-Fi alive
-  connectWiFi();
-
-  // retry claiming every 30 s until it succeeds
-  if (needsClaim && WiFi.status() == WL_CONNECTED &&
-      now - lastClaimAttemptMs >= 30000UL) {
-    lastClaimAttemptMs = now;
-    if (tryClaim()) {
+  // network task -> UI events (server cleared the code, claim outcome)
+  int evType;
+  while (xQueueReceive(netEventQueue, &evType, 0) == pdTRUE) {
+    if (evType == NET_EVENT_CODE_CLEARED) {
+      lcdShow("Code cleared", "");
+    } else if (evType == NET_EVENT_CLAIM_OK) {
       lcdShow("Box paired!", "");
       delay(1500);
       lcdShow("Enter Code", "");
-    } else {
+    } else if (evType == NET_EVENT_CLAIM_FAILED) {
       lcdShow("Claim failed", "check code/expiry");
     }
   }
 
-  // flush queued reports whenever we can
-  flushPendingEvents();
+  // local TTL expiry (no RTC, so the countdown is millis()-based)
+  bool codeExpired = false;
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    codeExpired = activeCode[0] != '\0' && now > codeExpiresMs;
+    xSemaphoreGive(stateMutex);
+  }
+  if (codeExpired) {
+    clearCode();
+    lcdShow("Code expired", "");
+  }
 
   if (state == STATE_LOCKOUT) {
+    char dump;
+    while (xQueueReceive(keyQueue, &dump, 0) == pdTRUE) {
+      // discard keys typed during lockout so none fire after it ends
+    }
     if (now > lockoutUntilMs) {
       digitalWrite(PIN_RED, LOW);
       lcdShow("Enter Code", "");
@@ -887,15 +992,9 @@ void loop() {
     return;  // no keys, no polling during lockout
   }
 
-  // keypad input (IDLE, KEYPAD and OPEN states)
-  char key = keypad.getKey();
-  if (key) handleKey(key);
-
-  // poll /sync every 3 s, but only when the keypad has been quiet for 5 s
-  if (state == STATE_IDLE &&
-      now - lastPollMs >= POLL_INTERVAL_MS &&
-      now - lastKeyMs >= KEYPAD_QUIET_MS) {
-    lastPollMs = now;
-    pollSync();
+  // keypad input (IDLE, KEYPAD and OPEN states) — served from the scan task
+  char key;
+  while (xQueueReceive(keyQueue, &key, 0) == pdTRUE) {
+    handleKey(key);
   }
 }
