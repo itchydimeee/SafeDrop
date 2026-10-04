@@ -816,11 +816,14 @@ void setup() {
   eepromInit();
   loadConfig();
 
-  // Hold '*' at power-on -> setup portal (5 s window)
-  lcdShow("Hold * for", "setup mode");
+  // Hold '*' (or the board's BOOT button) at power-on -> setup portal.
+  // BOOT is on GPIO 0; hold it after reset, not during power-on (that
+  // would drop the chip into the ROM download mode instead).
+  pinMode(0, INPUT_PULLUP);
+  lcdShow("Hold * or BOOT", "for setup mode");
   unsigned long t0 = millis();
   while (millis() - t0 < 5000) {
-    if (keypad.getKey() == '*') {
+    if (keypad.getKey() == '*' || digitalRead(0) == LOW) {
       runSetupPortal();  // never returns
     }
     delay(10);
