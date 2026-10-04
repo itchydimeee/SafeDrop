@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lead Orchestrator"
+  short_description: "Delegate, verify, and synthesize agent work"
+  default_prompt: "Use $lead-orchestrator to decompose this objective, delegate bounded work, verify each result, and deliver the approved outcome."

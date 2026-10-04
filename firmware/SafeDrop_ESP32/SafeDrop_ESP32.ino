@@ -783,6 +783,24 @@ void setup() {
   lockBolt();
 
   Wire.begin(PIN_SDA, PIN_SCL);
+  // Find the backpack: 0x27 (PCF8574) or 0x3F (PCF8574A) by default;
+  // strap variants can land anywhere in 0x20-0x27 / 0x38-0x3F.
+  byte lcdAddr = 0;
+  for (byte a = 0x20; a <= 0x27 && lcdAddr == 0; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) lcdAddr = a;
+  }
+  for (byte a = 0x38; a <= 0x3F && lcdAddr == 0; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) lcdAddr = a;
+  }
+  if (lcdAddr == 0) {
+    Serial.println("No I2C LCD backpack found — check VCC(5V)/GND and SDA->D21, SCL->D22");
+  } else {
+    Serial.print("LCD backpack found at 0x");
+    Serial.println(lcdAddr, HEX);
+    lcd = LiquidCrystal_I2C(lcdAddr, 16, 2);
+  }
   lcd.init();
   lcd.backlight();
   lcdShow("SafeDrop", "Starting...");
